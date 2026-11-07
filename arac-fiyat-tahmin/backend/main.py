@@ -1,58 +1,90 @@
+import json
 import logging
 import os
-from typing import Literal
+from pathlib import Path
+from typing import Any
+
 import joblib
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, model_validator
-from train_model import ARTIFACT_PATH, train_and_save
+from pydantic import BaseModel, Field
 
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("otodeger")
 
-VEHICLE_MODELS = {
-    "Toyota": ["Corolla", "Yaris"],
-    "Renault": ["Clio", "Megane"],
-    "Fiat": ["Egea", "Punto"],
-    "Volkswagen": ["Golf", "Polo"],
-    "Ford": ["Focus", "Fiesta"],
-    "Hyundai": ["i20", "i30"],
-}
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = Path(os.getenv("MODEL_PATH", BASE_DIR / "otodeger_best_model.joblib"))
+METADATA_PATH = Path(os.getenv("METADATA_PATH", BASE_DIR / "model_metadata.json"))
 
-if ARTIFACT_PATH.exists():
-    artifact = joblib.load(ARTIFACT_PATH)
-    model, metrics = artifact["model"], artifact["metrics"]
-else:
-    model, metrics = train_and_save()
+if not MODEL_PATH.exists():
+    raise RuntimeError(
+        f"Model dosyası bulunamadı: {MODEL_PATH}. "
+        "otodeger_best_model.joblib dosyasını backend klasörüne ekleyin."
+    )
+
+model = joblib.load(MODEL_PATH)
+metadata = json.loads(METADATA_PATH.read_text(encoding="utf-8")) if METADATA_PATH.exists() else {}
+
+FEATURE_COLUMNS = metadata.get("feature_columns", [
+    "brand", "fuel", "body", "transmission", "engine", "city",
+    "district", "color", "seller", "damage", "year", "km", "vehicle_model"
+])
+NUMERIC_FEATURES = set(metadata.get("numeric_features", ["year", "km"]))
+
+# Seçenekleri doğrudan eğitilmiş Pipeline içindeki OneHotEncoder kategorilerinden al.
+def load_model_options() -> dict[str, list[Any]]:
+    try:
+        preprocess = model.named_steps["preprocess"]
+        encoder = preprocess.named_transformers_["cat"].named_steps["onehot"]
+        categorical_columns = preprocess.transformers_[1][2]
+        result = {}
+        for column, categories in zip(categorical_columns, encoder.categories_):
+            values = [v.item() if hasattr(v, "item") else v for v in categories]
+            result[column] = sorted(values, key=lambda x: str(x).casefold())
+        return result
+    except Exception:
+        logger.exception("Model kategorileri okunamadı.")
+        return {}
+
+OPTIONS = load_model_options()
+
+class VehicleInput(BaseModel):
+    brand: str = Field(min_length=1)
+    fuel: str = Field(min_length=1)
+    body: str = Field(min_length=1)
+    transmission: str = Field(min_length=1)
+    engine: str = Field(min_length=1)
+    city: str = Field(min_length=1)
+    district: str = Field(min_length=1)
+    color: str = Field(min_length=1)
+    seller: str = Field(min_length=1)
+    damage: str = Field(min_length=1)
+    year: int = Field(ge=1950, le=2035)
+    km: int = Field(ge=0, le=2_000_000)
+    vehicle_model: str = Field(min_length=1)
 
 app = FastAPI(
-    title="OtoDeğer Araç Fiyat Tahmin API",
-    description="Colab projesindeki Random Forest modelini kullanan demo API.",
-    version="1.0.0"
+    title="OtoDeğer API",
+    description="Türkiye ikinci el araç ilan fiyatı tahmin servisi.",
+    version="2.0.0"
 )
+
+allowed_origins = [
+    origin.strip()
+    for origin in os.getenv(
+        "ALLOWED_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173"
+    ).split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if origin.strip()],
+    allow_origins=allowed_origins,
     allow_credentials=False,
     allow_methods=["GET", "POST"],
     allow_headers=["*"]
 )
-
-class VehicleInput(BaseModel):
-    marka: Literal["Toyota", "Renault", "Fiat", "Volkswagen", "Ford", "Hyundai"]
-    model: str = Field(min_length=1, max_length=40)
-    yil: int = Field(ge=2005, le=2025)
-    kilometre: int = Field(ge=0, le=1_000_000)
-    yakit: Literal["Benzin", "Dizel", "LPG", "Hibrit"]
-    vites: Literal["Manuel", "Otomatik"]
-    motor_hacmi: float = Field(ge=0.8, le=5.0)
-    hasarli: Literal["Hayır", "Evet"]
-
-    @model_validator(mode="after")
-    def validate_model_for_brand(self):
-        if self.model not in VEHICLE_MODELS[self.marka]:
-            raise ValueError("Seçilen marka ve model birbiriyle eşleşmiyor.")
-        return self
 
 @app.get("/")
 def root():
@@ -60,42 +92,56 @@ def root():
 
 @app.get("/api/health")
 def health():
-    return {"durum": "aktif", "model": "RandomForestRegressor", "metrikler": metrics}
+    metrics = metadata.get("metrics", {})
+    return {
+        "durum": "aktif",
+        "model": metadata.get("selected_model", "Random Forest"),
+        "metrikler": {
+            "mae": metrics.get("MAE_TL"),
+            "rmse": metrics.get("RMSE_TL"),
+            "r2": metrics.get("R2")
+        },
+        "egitim_kaydi": metadata.get("training_rows"),
+        "test_kaydi": metadata.get("test_rows"),
+        "veri_turu": "Türkiye ikinci el araç ilan verisi"
+    }
 
 @app.get("/api/options")
 def options():
     return {
-        "markalar": VEHICLE_MODELS,
-        "yakitlar": ["Benzin", "Dizel", "LPG", "Hibrit"],
-        "vitesler": ["Manuel", "Otomatik"],
-        "motor_hacimleri": [1.0, 1.2, 1.4, 1.6, 1.8, 2.0],
-        "hasar_durumlari": ["Hayır", "Evet"]
+        "secenekler": OPTIONS,
+        "alanlar": FEATURE_COLUMNS,
+        "sayisal_alanlar": sorted(NUMERIC_FEATURES)
     }
 
 @app.post("/api/predict")
 def predict(vehicle: VehicleInput):
     try:
-        row = pd.DataFrame([{
-            "Marka": vehicle.marka,
-            "Model": vehicle.model,
-            "Yil": vehicle.yil,
-            "Kilometre": vehicle.kilometre,
-            "Yakit": vehicle.yakit,
-            "Vites": vehicle.vites,
-            "Motor_Hacmi": vehicle.motor_hacmi,
-            "Hasarli": vehicle.hasarli
-        }])
-        price = max(0, float(model.predict(row)[0]))
+        values = vehicle.model_dump()
+        row = pd.DataFrame([{column: values[column] for column in FEATURE_COLUMNS}])
+        for column in NUMERIC_FEATURES:
+            row[column] = pd.to_numeric(row[column], errors="raise")
+
+        price = float(model.predict(row)[0])
+        if not pd.notna(price):
+            raise ValueError("Model geçerli bir tahmin üretemedi.")
+        price = max(0, price)
+
+        # Bu aralık istatistiksel güven aralığı değil, yalnızca yaklaşık sunum aralığıdır.
         return {
             "tahmini_fiyat_tl": round(price),
             "alt_deger_tl": round(price * 0.94),
             "ust_deger_tl": round(price * 1.06),
-            "model": "RandomForestRegressor",
-            "veri_notu": "Model, Colab projesindeki 1.000 satırlık sentetik veriyle eğitilmiştir. Sonuç gerçek piyasa fiyatı garantisi değildir."
+            "model": metadata.get("selected_model", "Random Forest"),
+            "veri_notu": (
+                "Tahmin, Türkiye ikinci el araç ilan verileriyle eğitilmiş modele dayanır. "
+                "İlan fiyatı gerçekleşmiş satış fiyatı değildir; sonuç ekspertiz veya "
+                "kesin piyasa değeri garantisi vermez."
+            )
         }
     except Exception as exc:
         logger.exception("Araç fiyatı tahmin edilirken hata oluştu.")
         raise HTTPException(
             status_code=500,
-            detail="Tahmin şu anda oluşturulamadı. Lütfen daha sonra tekrar deneyin."
+            detail="Tahmin oluşturulamadı. Girilen araç bilgilerini kontrol edip tekrar deneyin."
         ) from exc

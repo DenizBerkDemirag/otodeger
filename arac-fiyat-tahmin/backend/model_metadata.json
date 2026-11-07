@@ -1,0 +1,48 @@
+{
+  "project": "OtoDeğer",
+  "target": "price_tl",
+  "target_description": "Türkiye ikinci el araç ilan fiyatı (TL)",
+  "selected_model": "Random Forest",
+  "feature_columns": [
+    "brand",
+    "fuel",
+    "body",
+    "transmission",
+    "engine",
+    "city",
+    "district",
+    "color",
+    "seller",
+    "damage",
+    "year",
+    "km",
+    "vehicle_model"
+  ],
+  "numeric_features": [
+    "year",
+    "km"
+  ],
+  "categorical_features": [
+    "brand",
+    "fuel",
+    "body",
+    "transmission",
+    "engine",
+    "city",
+    "district",
+    "color",
+    "seller",
+    "damage",
+    "vehicle_model"
+  ],
+  "metrics": {
+    "MAE_TL": 159286.81173065316,
+    "RMSE_TL": 802308.1284875737,
+    "R2": 0.6345498191384223
+  },
+  "training_rows": 48000,
+  "test_rows": 12000,
+  "random_state": 42,
+  "data_source": "https://github.com/tambiyusuf/car-market-analysis-tubitak",
+  "note": "Metrics are valid only for this dataset snapshot and this train/test split."
+}
